@@ -1,192 +1,434 @@
+"""
+Hermes WebUI Dashboard Plugin — Backend API
+
+Auto-mounted by the Hermes Dashboard at /api/plugins/hermes-webui/
+Provides session creation, streaming chat, and file browsing endpoints.
+
+NO separate server process — this runs inside the dashboard's FastAPI app.
+"""
+import asyncio
+import json
+import logging
 import os
-import socket
-import subprocess
-import httpx
-from fastapi import APIRouter, Request
-from fastapi.responses import Response
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Configuration
-WEBUI_DEFAULT_PORT = 8080
-WEBUI_HOST = "127.0.0.1"
-WEBUI_COMMON_PORTS = [8080, 8081, 8082, 8888, 5000]
+# ---------------------------------------------------------------------------
+# Add hermes-agent to path so we can import AIAgent and SessionDB
+# ---------------------------------------------------------------------------
+_HERMES_AGENT_PATHS = [
+    os.path.expanduser("~/Drive/Projects/hermes-agent"),
+    os.path.expanduser("~/.hermes/hermes-agent"),
+    str(Path(__file__).resolve().parent.parent.parent.parent / "hermes-agent"),
+]
+for p in _HERMES_AGENT_PATHS:
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
-_webui_process = None
+# ---------------------------------------------------------------------------
+# Stream registry (module-level, thread-safe)
+# ---------------------------------------------------------------------------
+_STREAMS: dict[str, asyncio.Queue] = {}
+_STREAMS_LOCK = threading.Lock()
+_STREAM_CANCEL: set[str] = set()
 
-
-def _probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
-    """Return True if port is open."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        return s.connect_ex((host, port)) == 0
-    except Exception:
-        return False
-    finally:
-        s.close()
-
-
-def _find_webui_port() -> int | None:
-    """Scan common ports for a running webui server."""
-    for port in WEBUI_COMMON_PORTS:
-        if _probe_port(WEBUI_HOST, port, timeout=0.3):
-            return port
-    return None
-
-
-def _find_webui_process() -> list[str]:
-    """Find running webui server.py PIDs."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "server.py"],
-            capture_output=True, text=True, timeout=2
-        )
-        pids = result.stdout.strip().split("\n") if result.stdout.strip() else []
-        return [p for p in pids if p]
-    except Exception:
-        return []
-
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
 
 @router.get("/status")
 async def get_status():
-    """Return webui server status and URL."""
-    # First try default port
-    if _probe_port(WEBUI_HOST, WEBUI_DEFAULT_PORT):
-        port = WEBUI_DEFAULT_PORT
-        running = True
-    else:
-        port = _find_webui_port()
-        running = port is not None
-
-    return {
-        "running": running,
-        "url": f"http://{WEBUI_HOST}:{port}" if running else None,
-        "port": port,
-        "pids": _find_webui_process(),
-    }
+    return {"ok": True, "version": "2.0.0"}
 
 
-@router.get("/config")
-async def get_config():
-    """Return plugin configuration including webui URL and capabilities."""
-    status = await get_status()
-    return {
-        "webui_url": status["url"],
-        "running": status["running"],
-        "version": "1.0.0",
-        "capabilities": {
-            "embedded": False,
-            "theme_sync": False,
-            "auth_passthrough": False,
-        },
-    }
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
 
+@router.post("/sessions")
+async def create_session(request: Request):
+    """Create a new Hermes session."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-@router.post("/start")
-async def start_webui():
-    """Start the webui server."""
-    global _webui_process
-    # Check if already running
-    existing_port = _find_webui_port()
-    if existing_port is not None:
-        return {"status": "already_running", "port": existing_port}
-    if _webui_process and _webui_process.poll() is None:
-        return {"status": "already_running", "pid": _webui_process.pid}
-
-    # Try to find webui server.py
-    candidate_paths = [
-        os.path.expanduser("~/Drive/Projects/hermes-dashboard/hermes_webui_reference"),
-        os.path.expanduser("~/.hermes/plugins/hermes-webui/webui"),
-    ]
-    webui_dir = None
-    for p in candidate_paths:
-        if os.path.isfile(os.path.join(p, "server.py")):
-            webui_dir = p
-            break
-
-    if not webui_dir:
-        return {"status": "error", "message": "WebUI server.py not found in known locations"}
+    workspace = body.get("workspace") or os.getcwd()
+    model = body.get("model") or ""
 
     try:
-        _webui_process = subprocess.Popen(
-            ["python3", "server.py"],
-            cwd=webui_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return {"status": "started", "pid": _webui_process.pid, "cwd": webui_dir}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-@router.post("/stop")
-async def stop_webui():
-    """Stop the webui server managed by this plugin."""
-    global _webui_process
-    if _webui_process and _webui_process.poll() is None:
-        _webui_process.terminate()
+        from hermes_state import SessionDB
+        db = SessionDB()
         try:
-            _webui_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _webui_process.kill()
-            _webui_process.wait()
-        _webui_process = None
-        return {"status": "stopped"}
-    return {"status": "not_running"}
+            session_id = db.create_session(
+                title="WebUI Session",
+                model=model or None,
+                workspace=workspace,
+            )
+            return {
+                "session_id": session_id,
+                "workspace": workspace,
+                "model": model or None,
+                "created_at": time.time(),
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        logger.exception("Failed to create session")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Phase 2: API proxy bridge
-@router.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_webui(path: str, request: Request):
-    """Proxy requests to the webui API server."""
-    port = _find_webui_port()
-    if port is None:
-        return {"error": "WebUI server not running"}
+# ---------------------------------------------------------------------------
+# Chat streaming
+# ---------------------------------------------------------------------------
 
-    target_url = f"http://127.0.0.1:{port}/{path}"
+def _run_agent_thread(
+    stream_id: str,
+    session_id: str,
+    message: str,
+    model: Optional[str],
+    workspace: str,
+    loop: asyncio.AbstractEventLoop,
+):
+    """Run the agent in a daemon thread and feed events to the queue."""
+    queue = _STREAMS.get(stream_id)
+    if queue is None:
+        return
+
+    async def emit(event_type: str, data):
+        try:
+            queue.put_nowait({"type": event_type, "data": data})
+        except asyncio.QueueFull:
+            pass
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            method = request.method
-            headers = dict(request.headers)
-            # Remove host header to avoid conflicts
-            headers.pop("host", None)
-            body = await request.body()
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
 
-            resp = await client.request(
-                method=method,
-                url=target_url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params)
+        # Load session
+        db = SessionDB()
+        try:
+            session = db.get_session(session_id)
+            if not session:
+                future = asyncio.run_coroutine_threadsafe(
+                    emit("error", "Session not found"), loop
+                )
+                return
+            messages = session.get("messages") or []
+        finally:
+            db.close()
+
+        # Save/restore HERMES_HOME
+        saved_home = os.environ.get("HERMES_HOME", "")
+        os.environ["HERMES_HOME"] = os.path.expanduser("~/.hermes")
+
+        try:
+            # Build conversation history
+            conversation_history = messages if isinstance(messages, list) else []
+
+            # Create agent
+            agent = AIAgent(
+                model=model or "",
+                platform="cli",
+                quiet_mode=True,
+                session_id=session_id,
+                enabled_toolsets=None,  # Use defaults
             )
 
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
-                media_type=resp.headers.get("content-type", "application/json")
+            # Stream callbacks
+            def on_token(text: Optional[str]):
+                if text is None:
+                    return
+                future = asyncio.run_coroutine_threadsafe(
+                    emit("token", text), loop
+                )
+                try:
+                    future.result(timeout=1)
+                except Exception:
+                    pass
+
+            def on_tool(name: str, preview: str):
+                future = asyncio.run_coroutine_threadsafe(
+                    emit("tool", {"name": name, "preview": preview}), loop
+                )
+                try:
+                    future.result(timeout=1)
+                except Exception:
+                    pass
+
+            # Check cancel
+            if stream_id in _STREAM_CANCEL:
+                future = asyncio.run_coroutine_threadsafe(
+                    emit("done", {"cancelled": True}), loop
+                )
+                return
+
+            # Run agent
+            result = agent.run_conversation(
+                user_message=message,
+                conversation_history=conversation_history,
+                task_id=session_id,
             )
+
+            # Save updated messages
+            final_response = result.get("final_response", "")
+            updated_messages = result.get("messages", conversation_history)
+
+            db = SessionDB()
+            try:
+                db.update_session(session_id, {"messages": updated_messages})
+            finally:
+                db.close()
+
+            future = asyncio.run_coroutine_threadsafe(
+                emit("done", {
+                    "final_response": final_response,
+                    "session_id": session_id,
+                    "message_count": len(updated_messages),
+                }),
+                loop,
+            )
+
+        finally:
+            os.environ["HERMES_HOME"] = saved_home
+
     except Exception as e:
-        return {"error": f"Proxy error: {str(e)}"}
+        logger.exception("Agent thread error")
+        future = asyncio.run_coroutine_threadsafe(
+            emit("error", str(e)), loop
+        )
+    finally:
+        # Schedule cleanup
+        def cleanup():
+            with _STREAMS_LOCK:
+                if stream_id in _STREAMS:
+                    del _STREAMS[stream_id]
+                _STREAM_CANCEL.discard(stream_id)
+        loop.call_soon_threadsafe(cleanup)
 
 
-# Phase 2: Theme sync stub
-@router.get("/theme")
-async def get_theme_config():
-    """Return theme synchronization status."""
-    return {
-        "enabled": False,
-        "note": "Theme sync is a Phase 3 feature. Planned via postMessage bridge."
-    }
+@router.post("/chat/start")
+async def start_chat(request: Request):
+    """Start a chat with the Hermes agent. Returns stream_id for SSE."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    session_id = body.get("session_id")
+    message = body.get("message", "")
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if not message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+
+    # Get session info for model
+    model = body.get("model")
+    workspace = body.get("workspace") or os.getcwd()
+
+    if not model:
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                session = db.get_session(session_id)
+                if session:
+                    model = session.get("model")
+                    workspace = session.get("workspace") or workspace
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+    # Create stream
+    stream_id = uuid.uuid4().hex[:12]
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+    with _STREAMS_LOCK:
+        _STREAMS[stream_id] = queue
+        _STREAM_CANCEL.discard(stream_id)
+
+    # Spawn agent thread
+    loop = asyncio.get_running_loop()
+    thread = threading.Thread(
+        target=_run_agent_thread,
+        args=(stream_id, session_id, message, model, workspace, loop),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"stream_id": stream_id, "status": "started"}
 
 
-# Phase 2: Auth passthrough stub
-@router.get("/auth")
-async def get_auth_config():
-    """Return auth passthrough status."""
-    return {
-        "enabled": False,
-        "note": "Auth passthrough is a Phase 3 feature. Planned via shared session token."
-    }
+@router.get("/chat/stream/{stream_id}")
+async def stream_chat(stream_id: str, request: Request):
+    """SSE endpoint for streaming agent events."""
+    with _STREAMS_LOCK:
+        queue = _STREAMS.get(stream_id)
+
+    if queue is None:
+        raise HTTPException(status_code=404, detail="Stream not found")
+
+    async def event_generator():
+        heartbeat_interval = 15
+        last_event = time.time()
+
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Send heartbeat if needed
+                    if time.time() - last_event > heartbeat_interval:
+                        yield ": heartbeat\n\n"
+                        last_event = time.time()
+                    continue
+
+                last_event = time.time()
+                event_type = event.get("type", "message")
+                data = event.get("data", "")
+
+                if isinstance(data, (dict, list)):
+                    data_str = json.dumps(data)
+                else:
+                    data_str = str(data)
+
+                # SSE format: event: <type>\ndata: <json>\n\n
+                yield f"event: {event_type}\ndata: {data_str}\n\n"
+
+                if event_type in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception("SSE generator error")
+            yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
+        finally:
+            # Clean up
+            with _STREAMS_LOCK:
+                if stream_id in _STREAMS:
+                    # Drain remaining items
+                    while not queue.empty():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    del _STREAMS[stream_id]
+                _STREAM_CANCEL.discard(stream_id)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/chat/cancel/{stream_id}")
+async def cancel_chat(stream_id: str):
+    """Cancel a running agent stream."""
+    with _STREAMS_LOCK:
+        if stream_id in _STREAMS:
+            _STREAM_CANCEL.add(stream_id)
+            return {"status": "cancelled"}
+    return {"status": "not_found"}
+
+
+# ---------------------------------------------------------------------------
+# File browser
+# ---------------------------------------------------------------------------
+
+MAX_FILE_BYTES = 200 * 1024  # 200KB
+
+
+def _safe_resolve(root: str, requested: str) -> str:
+    """Resolve path relative to root, preventing traversal."""
+    root_path = Path(root).resolve()
+    target = (root_path / requested).resolve()
+    try:
+        target.relative_to(root_path)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal denied")
+    return str(target)
+
+
+@router.get("/files")
+async def list_files(path: str = Query(default=".")):
+    """List files in a workspace directory."""
+    root = Path(path).expanduser().resolve()
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Directory not found")
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Path is not a directory")
+
+    try:
+        entries = []
+        for entry in sorted(root.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            try:
+                stat = entry.stat()
+                entries.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": stat.st_size,
+                })
+            except OSError:
+                continue
+
+            if len(entries) >= 200:
+                break
+
+        return {"path": str(root), "entries": entries}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/files/content")
+async def read_file_content(
+    path: str = Query(...),
+    file: str = Query(...),
+):
+    """Read file content (max 200KB)."""
+    target = _safe_resolve(path, file)
+
+    try:
+        file_path = Path(target)
+        if not file_path.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
+
+        size = file_path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"File too large (max {MAX_FILE_BYTES} bytes)")
+
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        lines = content.count("\n") + 1
+
+        return {
+            "content": content,
+            "path": str(file_path),
+            "size": size,
+            "lines": lines,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

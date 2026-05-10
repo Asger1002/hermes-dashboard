@@ -1,9 +1,9 @@
 {
   "name": "hermes-webui",
   "label": "WebUI",
-  "description": "Classic Hermes WebUI interface embedded in the dashboard",
+  "description": "Native Hermes WebUI — chat, sessions, config, models, skills, profiles, cron, analytics, logs",
   "icon": "Globe",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "tab": {
     "path": "/webui",
     "position": "after:skills"
