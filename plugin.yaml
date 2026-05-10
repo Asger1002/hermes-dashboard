@@ -1,0 +1,4 @@
+name: hermes-webui
+version: "1.0.0"
+description: "Classic Hermes WebUI interface embedded in the Hermes dashboard as a plugin tab"
+author: "Asger"

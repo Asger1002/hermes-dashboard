@@ -1,0 +1,13 @@
+{
+  "name": "hermes-webui",
+  "label": "WebUI",
+  "description": "Classic Hermes WebUI interface embedded in the dashboard",
+  "icon": "Globe",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/webui",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
