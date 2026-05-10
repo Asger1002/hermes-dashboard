@@ -1,4 +1,4 @@
 name: hermes-webui
-version: "1.0.0"
-description: "Classic Hermes WebUI interface embedded in the Hermes dashboard as a plugin tab"
+version: "2.0.0"
+description: "Native Hermes WebUI — chat, sessions, models, config, skills, profiles, cron, analytics, and logs in a single dashboard plugin tab"
 author: "Asger"
