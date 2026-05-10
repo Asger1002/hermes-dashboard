@@ -245,9 +245,12 @@
   // Tab: Chat
   // =========================================================================
   function ChatTab() {
-    var sessions = useState([])[0];
-    var sessionId = useState(null)[0];
-    var sessionIdSet = useState(null)[1];
+    var sessionsState = useState([]);
+    var sessions = sessionsState[0];
+    var setSessions = sessionsState[1];
+    var sessionIdState = useState(null);
+    var sessionId = sessionIdState[0];
+    var sessionIdSet = sessionIdState[1];
     var messagesState = useState([]);
     var messages = messagesState[0];
     var setMessages = messagesState[1];
@@ -272,7 +275,7 @@
     useEffect(function () {
       api.getSessions(50, 0).then(function (data) {
         var s = data.sessions || [];
-        sessions[1](s);
+        setSessions(s);
       }).catch(function (e) {
         setError("Failed to load sessions: " + e.message);
       });
@@ -300,7 +303,7 @@
       }).then(function (data) {
         sessionIdSet(data.session_id);
         setMessages([]);
-        api.getSessions(50, 0).then(function (d) { sessions[1](d.sessions || []); });
+        api.getSessions(50, 0).then(function (d) { setSessions(d.sessions || []); });
       }).catch(function (e) {
         setError("Failed to create session: " + e.message);
       });
