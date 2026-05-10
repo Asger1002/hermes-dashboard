@@ -3,3 +3,6 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Reference webui (read-only, not part of the plugin build)
+hermes_webui_reference/
